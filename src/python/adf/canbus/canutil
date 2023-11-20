@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+# vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4
+
+'''UTILTIY'''
+
+import time
+from logger import _read_csv, _write_csv_can
+from can import Message
+from getopt import getopt
+import threading
+import logging
+import sys
+log = logging.getLogger(__name__)
+
+
+class Sniff(threading.Thread):
+
+    def __init__(self, bus):
+        self.bus = bus
+        threading.Thread.__init__(self)
+        self.stop = False
+        self.ids = {}
+        self.start()
+
+    def run(self):
+        while not self.stop:
+            try:
+                m = self.bus.recv(timeout=1)
+                if m:
+                    self.ids[m.arbitration_id] = m
+            except:
+                pass
+
+
+try:
+    opts, args = getopt(sys.argv[1:], 'svu:i:t:w:')
+    opts = dict(opts)
+    if not opts:
+        raise
+    iface = opts.get('-i', None)
+    addr = opts.get('-u', None)
+    t_offset = float(opts.get('-t', 0.0))
+    verbose = '-v' in opts
+    outfh = sys.stdout
+    if '-w' in opts:
+        outfh = open(opts['-w'], 'w')
+    lock = key = None
+    if not iface and not addr:
+        raise
+
+except Exception as e:
+    print("usage: %s [-v] <-i interface | -u addr:port> [-t time_offset] [file to send (- for stdin) | -s | -w file to write ]" % (sys.argv[0]))
+    sys.exit()
+
+can = canoip = infh = sniff = None
+
+if verbose:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.INFO)
+if iface:
+    from canbus import CANOPTS
+    from can import Bus
+    can = Bus(iface, **CANOPTS)
+if addr:
+    from adf import *
+    from canbus import CANoverIP
+    addr, port = addr.split(':')
+    canoip = CANoverIP(addr=addr, port=port)
+
+if '-s' in opts:
+    filters = []
+    sniff = Sniff(can)
+    try:
+        filters = [int(f) for f in args.split(',')]
+    except:
+        filters = None
+
+else:
+    infh = None
+    if args and args[0] == '-':
+        infh = sys.stdin
+    elif args:
+        infh = open(args[0])
+
+t_base = time.time()
+
+if infh:
+    log.info('reading %s', str(infh))
+    while True:
+        try:
+            msg = _read_csv(infh, j1708_channel=None)
+            t_tick = time.time()-t_base+t_offset
+            while t_tick < msg.timestamp:
+                t = time.time()-t_base+t_offset
+                if verbose and (int(t_tick) != int(t)):
+                    print(t)
+                t_tick = t
+            if verbose:
+                log.debug(msg)
+            if can:
+                can.send(msg)
+            if canoip:
+                canoip.handle_packet(None, msg)
+        except KeyboardInterrupt:
+            break
+        except StopIteration:
+            break
+        except Exception as e:
+            log.warning(e)
+
+
+elif sniff:
+    CLEAR = '\x1b[2J'
+    CLEAR_TO_END = '\x1b[0J'
+    HOME = '\x1b[H'  # home cursor
+    HDR = "%-4s %-17s %-8s %1s %2s:%-6s %s" % (
+        'bus', 'ts', 'id', 'p', 'SA', 'PGN', 'data')
+    try:
+        from canbus import J1939Decoder
+        j1939 = J1939Decoder()
+    except Exception as e:
+        print(e)
+
+    def decode_msg(msg):
+        info = dict(ts=msg.timestamp, source=msg.channel,
+                    id=msg.arbitration_id)
+        try:
+            info, msg = j1939.effect(info, msg)
+            if filters and info['J1939']['PGN'] not in filters:
+                return None
+        except:
+            pass
+        s = '%(source)s %(ts)16.6f %(id)08x ' % info
+        try:
+            s += '%(priority)s %(SA)02x:%(PGN)s ' % info['J1939']
+        except:
+            pass
+        s += ' %-50s' % ' '.join('%02x' % d for d in msg.data)
+        if filters:
+            try:
+                s += '\n%15s%60s' % (info['J1939']['params']['name']+':', ' ')
+                for p in info['J1939']['params']:
+                    if p == 'name' or p == 'PGN':
+                        continue
+                    s += '\n%20s%s: %-50s' % (' ', p,
+                                              str(info['J1939']['params'][p]))
+            except:
+                pass
+        return s
+
+    ts = 0
+    print(CLEAR)
+    while True:
+        try:
+            time.sleep(1)
+            print(HOME+HDR)
+            for id, msg in sorted(sniff.ids.items()):
+                if msg.timestamp > ts:
+                    ts = msg.timestamp
+                if ts-msg.timestamp > 5:
+                    del sniff.ids[id]
+                else:
+                    d = decode_msg(msg)
+                    if d:
+                        print(d)
+            print(CLEAR_TO_END)
+        except KeyboardInterrupt:
+            break
+        ts += 1
+
+    sniff.stop = True
+    sniff.join()
+
+else:
+    msg = None
+    while True:
+        try:
+            if can:
+                msg = can.recv(timeout=1)
+            if msg is not None:
+                msg.timestamp = msg.timestamp-t_base+t_offset
+                _write_csv_can(outfh, msg)
+            else:
+                outfh.flush()
+        except KeyboardInterrupt:
+            break
+
+if can:
+    del can
+if infh:
+    infh.close()
+if outfh:
+    outfh.close()
+sys.exit()
