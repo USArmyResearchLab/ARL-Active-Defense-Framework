@@ -52,3 +52,5 @@ try: from .interface import Tap
 except: pass
 try: from .interface import Pcap
 except: pass
+try: from .interface import NFQueue
+except: pass

@@ -1,12 +1,9 @@
 from adf import *
 
-'''Interface requires ctypes to capture/inject and dpkt+IPy to decode
+'''Interface requires dpkt+IPy to decode
 Tap requires pytun
-Pcap requires pypcap'''
-try:
-    import ctypes
-except:
-    pass
+Pcap requires pypcap
+NFQueue requires netfilterqueue'''
 try:
     import dpkt
     from IPy import IP
@@ -24,37 +21,35 @@ class Interface(Plugin):
     '''we use raw sockets to eliminate the dependency on libpcap (and its read timeouts)
             anything that can be read as a socket (CANbus, etc...) would use similar code'''
     try:
-        ETHER_TYPE = 0x0003  # ETH_P_ALL
+        ETHER_TYPE = 0x0003  # ETH_P_ALL to capture all packets
+        SET_SRC_MAC = False  # if true, set emitted packet source MAC to interface MAC
+        # linux/if.h
+        IFF_PROMISC = 0x0100
+        # linux/sockios.h
+        SIOCGIFFLAGS = 0x8913  # get the active flags
+        SIOCSIFFLAGS = 0x8914  # set the active flags
+        SIOCGIFHWADDR = 0x8927  # get hardware address
 
-        class ifctl(ctypes.Structure):
-            '''shim class to handle setting interfaces to promisc mode'''
-            # linux/if.h
-            IFF_PROMISC = 0x100
-            # linux/sockios.h
-            SIOCGIFFLAGS = 0x8913  # get the active flags
-            SIOCSIFFLAGS = 0x8914  # set the active flags
-            _fields_ = [
-                ("ifr_ifrn", ctypes.c_char * 16),
-                ("ifr_flags", ctypes.c_short)
-            ]
+        def ifctl(self, ctl, fmt, *args):
+            import fcntl
+            dev = self.device.encode()
+            # add ifname to param struct
+            param = struct.pack('16s'+fmt, dev, *args)
+            # strip ifname and unpack return struct
+            return struct.unpack(fmt, fcntl.ioctl(self.__socket, ctl, param)[16:])
 
-            def __init__(self, socket, dev):
-                self.__socket = socket
-                self.__dev = dev.encode()
-                ctypes.Structure.__init__(self)
-
-            def set_promisc(self, promisc):
-                import fcntl
-                self.ifr_ifrn = self.__dev
-                fcntl.ioctl(self.__socket, self.SIOCGIFFLAGS,
-                            self)  # get interface flags
-                if promisc:
-                    self.ifr_flags |= self.IFF_PROMISC  # turn promisc on
-                elif (self.ifr_flags & self.IFF_PROMISC):
-                    self.ifr_flags ^= self.IFF_PROMISC  # turn promisc off if on
-                fcntl.ioctl(self.__socket, self.SIOCSIFFLAGS,
-                            self)  # set interface flags
-                return self.ifr_flags
+        def get_hwaddr(self, dev):
+            # return struct will be family, addr[0:14] but we only want addr[:6]
+            return self.ifctl(self.SIOCGIFHWADDR, 'H14s', 0, b'')[1][:6]
+            
+        def set_promisc(self, promisc):
+            flags = self.ifctl(self.SIOCGIFFLAGS, 'H', 0)[0]
+            if promisc:
+                flags |= self.IFF_PROMISC  # turn promisc on
+            elif (flags & self.IFF_PROMISC):
+                flags ^= self.IFF_PROMISC  # turn promisc off if on
+            flags = self.ifctl(self.SIOCSIFFLAGS, 'H', flags)[0]
+            return flags
 
         def main(self):
             '''capture thread, decodes packets and sends them to the next plugin'''
@@ -65,8 +60,8 @@ class Interface(Plugin):
                     socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 # set sniff interface, do this before setting promisc
                 self.__socket.bind((self.device, 0))
-                ifctl = self.ifctl(self.__socket, self.device)
-                ifctl.set_promisc(True)  # interface promisc on
+                self.hwaddr = self.get_hwaddr(self.device)
+                self.set_promisc(True)  # interface promisc on
 
                 while not self.is_shutdown():  # capture loop
                     try:
@@ -91,7 +86,7 @@ class Interface(Plugin):
                     except Exception as e:  # decode/dispatch errors are not fatal, do not stop capturing
                         self.warning(e)
 
-                ifctl.set_promisc(False)  # interface promisc off
+                self.set_promisc(False)  # interface promisc off
                 self.__socket.close()
 
             except Exception as e:  # startup failed
@@ -103,59 +98,76 @@ class Interface(Plugin):
                 if self.metrics:
                     self._metrics(info)
                 try:
+                    if self.SET_SRC_MAC:
+                        packet.src = self.hwaddr
                     return self.__socket.send(bytes(packet))
                 except Exception as e:
                     self.warning(e)
 
     except:
-        pass  # ctypes not available, can't raw capture/inject but try to provide decoding
+        pass  # a dep is not available, can't raw capture/inject but try to provide decoding
 
-    def _decode(self, ts, packet):
+    def _decode(self, ts, packet, info=None):
         '''decode packets headers down to TCP/UDP ports, return info and dpkt object'''
-        info = {'source': self.name, 'ts': ts,
-                'len': len(packet)}  # init to capture info
+        # init info if not passed in
+        if info is None:
+            info = {'source': self.name,
+                    'ts': ts,
+                    'len': len(packet)}   # init to capture info
         if int(self.decode):  # if not decoding, return capture info and raw packet
             try:
-                packet = dpkt.ethernet.Ethernet(
-                    packet)  # decode packet as ether
+                # decode packet as ether
+                packet = dpkt.ethernet.Ethernet(packet)
                 info.update(smac=packet.src, dmac=packet.dst,
                             etype=packet.type)
                 try:
                     info.update(vlan=packet.tag)  # get vlan tag
                 except:
                     pass  # no VLAN tag
-                d = packet.data  # drill down to layer 3
+                l3 = packet.data  # drill down to layer 3
                 if packet.type == dpkt.ethernet.ETH_TYPE_ARP:  # parse IP addrs out of ARP
-                    info.update(proto='arp', sip=IP(socket.inet_ntop(socket.AF_INET, d.spa)), dip=IP(
-                        socket.inet_ntop(socket.AF_INET, d.tpa)))
+                    info.update(proto='arp',
+                                sip=IP(socket.inet_ntop(
+                                    socket.AF_INET, l3.spa)),
+                                dip=IP(socket.inet_ntop(socket.AF_INET, l3.tpa)))
                 elif packet.type == dpkt.ethernet.ETH_TYPE_IP:  # parse IPv4 header
-                    info.update(proto=d.p, sip=IP(socket.inet_ntop(socket.AF_INET, d.src)), dip=IP(
-                        socket.inet_ntop(socket.AF_INET, d.dst)))
+                    info.update(proto=l3.p,
+                                sip=IP(socket.inet_ntop(
+                                    socket.AF_INET, l3.src)),
+                                dip=IP(socket.inet_ntop(socket.AF_INET, l3.dst)))
                 elif packet.type == dpkt.ethernet.ETH_TYPE_IP6:  # parse IPv6 header
-                    info.update(proto=d.nxt, sip=IP(socket.inet_ntop(socket.AF_INET6, d.src)), dip=IP(
-                        socket.inet_ntop(socket.AF_INET6, d.dst)))
+                    info.update(proto=l3.nxt,
+                                sip=IP(socket.inet_ntop(
+                                    socket.AF_INET6, l3.src)),
+                                dip=IP(socket.inet_ntop(socket.AF_INET6, l3.dst)))
                 else:  # not IP or ARP, stop here and return layer 3 as data
-                    info.update(data=d)
+                    info.update(data=l3)
                     return info, packet
-                try:
-                    # clear checksums
-                    d.sum = 0  # IP hdr checksum
-                    d.data.sum = 0  # TCP/UDP checksum
-                    # parse layer 4 header as TCP or UDP
-                    info.update(sport=d.data.sport, dport=d.data.dport)
-                    data = d.data.data  # data = protocol data
-                    # get TCP info
-                    try:
-                        info.update(flags=d.data.flags, seq=d.data.seq,
-                                    ack=d.data.ack, win=d.data.win)
-                    except:
-                        pass
-                except:
-                    data = d.data  # IP but not TCP/UDP
-                info.update(data=data)  # add protocol data to info
+                # add protocol data to info
+                info.update(data=self._decode_l4(l3, info))
             except Exception as e:
                 self.debug(e, exc_info=True)  # ether decoding error
-            return info, packet  # return info and packet
+        return info, packet  # return info and packet
+
+    def _decode_l4(self, l3, info):
+        # decode TCP/UDP
+        try:
+            # clear checksums
+            l3.sum = 0  # IP hdr checksum
+            l4 = l3.data  # get TCP
+            l4.sum = 0  # TCP/UDP checksum
+            # parse layer 4 header as TCP or UDP
+            info.update(sport=l4.sport, dport=l4.dport)
+            data = l4.data  # data = protocol data
+            # get TCP info
+            try:
+                info.update(flags=l4.flags, seq=l4.seq,
+                            ack=l4.ack, win=l4.win)
+            except:
+                pass
+        except:
+            data = l3.data  # IP but not TCP/UDP
+        return data
 
 
 try:
@@ -173,6 +185,7 @@ try:
                     flags=pytun.IFF_TAP | pytun.IFF_NO_PI, name=self.device)
             else:
                 self.__tap = pytun.TunTapDevice(
+
                     flags=pytun.IFF_TAP | pytun.IFF_NO_PI)
             self.device = bytes(self.__tap.name, 'ascii')
             if self.hwaddr:
@@ -208,6 +221,8 @@ try:
                 if self.metrics:
                     self._metrics(info)
                 try:
+                    if self.SET_SRC_MAC:
+                        packet.src = self.__tap.addr
                     self.__tap.write(bytes(packet))
                 except Exception as e:
                     self.warning(e)
@@ -315,6 +330,108 @@ except:
     pass  # no pypcap support
 
 
+try:
+    from netfilterqueue import NetfilterQueue
+
+    class NFQueue(Interface):
+        '''Netfilter Queue interface
+        for use with iptables rules like 
+
+iptables -I INPUT -i eth0 -j NFQUEUE --queue-num 1
+
+        or nftables rules like 
+
+table inet filter {
+        chain input {
+                type filter hook input priority filter; policy accept;
+                iif "eth0" queue to 1
+        }
+
+        chain forward {
+                type filter hook forward priority filter; policy accept;
+        }
+
+        chain output {
+                type filter hook output priority filter; policy accept;
+        }
+}
+table arp filter {
+        chain input {
+                type filter hook input priority filter; policy accept;
+                iif "eth0" queue to 1
+        }
+}
+
+        config: device=queue-num
+        info will have nfq_packet object + decode and packet will be dpkt object with plugin-generated layer 2 header
+         (source MAC and protocol will be valid but dest MAC will be zeros.)
+        on dispatch back to this interface, payload will be set to packet object (minus the layer 2 header) and accepted
+          (unless packet is None or drop=True in info)
+        '''
+
+        def accept(self, packet):
+            # called by nfq when we get a packet
+            try:
+                # decode the packet, putting the nfq packet object in info
+                info, packet = self._decode(time.time(), packet)
+                self.dispatch(info, packet)  # send the decoded packet
+            except Exception as e:  # decode/dispatch errors are not fatal, do not stop capturing
+                self.warning(e)
+
+        def handle_packet(self, info, payload, **kwargs):
+            '''if we are handed a packet, return it to NFQ'''
+            if self.__nfq and payload and self.filter_packet(info, payload):
+                if self.metrics:
+                    self._metrics(info)
+                try:
+                    packet = info.get('nfq_packet')
+                    # drop packets set to drop or with no payload
+                    if info.get('drop') or not payload:
+                        packet.drop()
+                    # strip the layer 2 header we generated, update the nfq payload and accept it.
+                    packet.set_payload(bytes(payload.data))
+                    return packet.accept()
+                except Exception as e:
+                    self.warning(e)
+
+        def main(self):
+            self.__nfq = NetfilterQueue()
+            self.__nfq.bind(int(self.device), self.accept)
+            nfq_sock = socket.fromfd(
+                self.__nfq.get_fd(), socket.AF_NETLINK, socket.SOCK_RAW)
+            # run until shutdown
+            while not self.is_shutdown():
+                nfq_sock.settimeout(1)
+                try:
+                    self.__nfq.run_socket(nfq_sock)
+                except socket.timeout:
+                    continue
+            # unbind
+            self.__nfq.unbind()
+
+        def _decode(self, ts, packet):
+            '''decode packets headers down to TCP/UDP ports, return info and dpkt object'''
+            # save the nfq packet object in the info
+            info = {'nfq_packet': packet,
+                    'source': self.name,
+                    'ts': ts,
+                    'len': packet.get_payload_len()}  # init to capture info, add 14 bytes for the layer 2 header
+            if int(self.decode):  # if not decoding, return capture info and raw packet
+                try:
+                    # packets from nfq start at layer 3 so we need to prepend a layer 2 header
+                    # we do not know the dest mac so leave it zeroed
+                    info['len'] += 14
+                    packet = dpkt.ethernet.Ethernet(
+                        src=packet.get_hw(), etype=packet.hw_protocol, data=packet.get_payload())
+                    # decode packet using Interface _decode
+                    info, packet = super()._decode(ts, bytes(packet), info)
+                except Exception as e:
+                    self.debug(e, exc_info=True)  # decoding error
+            return info, packet  # return info and packet as dpkt object
+except:
+    pass  # no NFQUEUE support
+
+
 def test(infile=None, outfile=None):
     '''Interface test harness
     If no args, creates Pcap<>Tun<--kernel-->Tun<>Raw chain and juggles some packets to test 
@@ -369,6 +486,7 @@ def test(infile=None, outfile=None):
 
 
 if __name__ == '__main__':
+
     import sys
     import logging
     logging.basicConfig(level=logging.DEBUG)
