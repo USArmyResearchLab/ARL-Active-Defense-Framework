@@ -274,25 +274,23 @@ try:
             if self.pcap:
                 last_ts = None
                 while not self.is_shutdown():
-                    for ts, packetdata in self.pcap.readpkts():
-                        if self.is_shutdown():
-                            break
-                        try:
-                            # get back packet info and dpkt obj
-                            info, packet = self._decode(ts, packetdata)
-                            if self.pcap_in and self.delta and ts:
-                                if last_ts is not None:
-                                    time.sleep(max(0, ts-last_ts))
-                                last_ts = ts
-                            # send the decoded packet
-                            self.dispatch(info, packet)
-                        except Exception as e:  # read error
-                            self.error(repr(e), exc_info=True)
-                            break
-                    if self.pcap_in:
-                        self.info('finished reading %s', self.pcap_in)
+                    try:
+                        ts, packetdata = self.pcap.__next__()
+                        # get back packet info and dpkt obj
+                        info, packet = self._decode(ts, packetdata)
+                        if self.pcap_in and self.delta and ts:
+                            if last_ts is not None:
+                                time.sleep(max(0, ts-last_ts))
+                            last_ts = ts
+                        # send the decoded packet
+                        self.dispatch(info, packet)
+                    except (StopIteration, KeyboardInterrupt):
                         break
-                del self.pcap
+                    except Exception as e:  # read error
+                        self.error(repr(e), exc_info=True)
+                        break
+                if self.pcap_in:
+                    self.info('finished reading %s', self.pcap_in)
             self.stop()
 
         def handle_packet(self, info, packet, **kwargs):
@@ -322,6 +320,9 @@ try:
                     self.warning(repr(e), exc_info=True)
 
         def stop(self):
+            if self.pcap:
+                self.pcap.close()
+                del self.pcap
             if self.pcap_fh:
                 del self.pcap_fh
             Interface.stop(self)

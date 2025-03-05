@@ -69,28 +69,62 @@ class Listener(Plugin):
     '''receives Events via TCP from Sender, queues them'''
     listen = 'localhost'
     port = 42224
+    ssl = None  # set to config dict to enable TLS mode
 
     def main(self):
         import socketserver
+        import ssl
 
-        class EventSocket(socketserver.BaseRequestHandler):
-            def handle(self):
-                try:
-                    l = struct.unpack('!L', self.request.recv(4))[0]
-                    event = pickle.loads(self.request.recv(l))
-                    event.path.append(self.server.parent.name)
-                    self.server.parent.debug(
-                        '%s %s %s', self.client_address, l, event)
-                    # we're not a Plugin instance so we have to call event in the parent
-                    self.server.parent.event(event=event)
-                except Exception as e:
-                    self.server.parent.debug(e)
+        if self.ssl:
+            class EventSocket(socketserver.StreamRequestHandler):
+                def handle(self):
+                    try:
+                        l = struct.unpack('!L', self.rfile.read(4))[0]
+                        event = pickle.loads(self.rfile.read(l))
+                        event.path.append(self.server.parent.name)
+                        self.server.parent.debug(
+                            '%s %s %s', self.client_address, l, event)
+                        # we're not a Plugin instance so we have to call event in the parent
+                        self.server.parent.event(event=event)
+                    except Exception as e:
+                        self.server.parent.debug(e)
+        else:
+            class EventSocket(socketserver.BaseRequestHandler):
+                def handle(self):
+                    try:
+                        l = struct.unpack('!L', self.request.recv(4))[0]
+                        event = pickle.loads(self.request.recv(l))
+                        event.path.append(self.server.parent.name)
+                        self.server.parent.debug(
+                            '%s %s %s', self.client_address, l, event)
+                        # we're not a Plugin instance so we have to call event in the parent
+                        self.server.parent.event(event=event)
+                    except Exception as e:
+                        self.server.parent.debug(e)
 
         class EventServer (socketserver.TCPServer):
             allow_reuse_address = True
 
+            def get_request(self):
+                newsocket, fromaddr = self.socket.accept()
+                if self.ssl:
+                    ctx = ssl.create_default_context(
+                        purpose=ssl.Purpose.CLIENT_AUTH, cafile=self.ssl.get('cafile'))
+                    ctx.load_cert_chain(certfile=self.ssl.get(
+                        'certfile'), keyfile=self.ssl.get('keyfile'))
+                    ctx.verify_mode = self.ssl.get(
+                        'verify', ssl.VerifyMode.CERT_NONE)
+                    ciphers = self.ssl.get('ciphers')
+                    if ciphers:
+                        ctx.set_ciphers(ciphers)
+                    connstream = ctx.wrap_socket(
+                        newsocket, server_side=True)
+                    return connstream, fromaddr
+                return newsocket, fromaddr
+
         self.__server = EventServer((self.listen, int(self.port)), EventSocket)
         self.__server.parent = self
+        self.__server.ssl = self.ssl
         self.log('event socket is %s', str(self.__server.server_address))
         self.__server.serve_forever()  # start listening
 
@@ -110,6 +144,7 @@ class Sender(Plugin):
     port = 42224
     timeout = 60
     __socket = None
+    ssl = None  # set to config dict to enable TLS mode
 
     def send(self, event):
         # turn event into a generic dict
@@ -117,10 +152,28 @@ class Sender(Plugin):
         if not self.__socket:  # open socket
             self.__socket = socket.create_connection(
                 (self.host, int(self.port)), 1)
+            if self.ssl:
+                import ssl
+                ctx = ssl.create_default_context(
+                        purpose=ssl.Purpose.CLIENT_AUTH, cafile=self.ssl.get('cafile'))
+                ctx.load_cert_chain(certfile=self.ssl.get(
+                    'certfile'), keyfile=self.ssl.get('keyfile'))
+                ctx.verify_mode = self.ssl.get(
+                    'verify', ssl.VerifyMode.CERT_NONE)
+                ciphers = self.ssl.get('ciphers')
+                if ciphers:
+                    ctx.set_ciphers(ciphers)
+                self.__connstream = ctx.wrap_socket(
+                    self.__socket, server_side=False)
+
         self.debug('sent %s %s %r', self.__socket, len(data), data)
         # send length followed by data
-        self.__socket.sendall(struct.pack('!L', len(data)))
-        self.__socket.sendall(data)
+        if self.ssl:
+            self.__connstream.write(struct.pack('!L', len(data)))
+            self.__connstream.write(data)
+        else:
+            self.__socket.sendall(struct.pack('!L', len(data)))
+            self.__socket.sendall(data)
 
     def handle_event(self, event):
         self.send(event)  # send event if we handle it
