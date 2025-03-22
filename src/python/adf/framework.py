@@ -38,11 +38,17 @@ class Framework(threading.Thread):
         # state will be lost if the manager process dies so ignore signals until we fork it
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        try:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        except:
+            pass
         self.manager = mp.Manager()
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        try:
+            signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        except:
+            pass
         # setup main thread
         self.__shutdown = threading.Event()
         self.__restart = False

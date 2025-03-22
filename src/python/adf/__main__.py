@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 
+
 def usage():
     print("%s <startup-config | startup-commands | - for config from STDIN>" %
           sys.argv[0])
@@ -58,12 +59,12 @@ def main():
         os.environ['ADF_MP'] = '1'
 
     # set ADF envar to base directory to allow easy access to configs
-    os.environ['ADF'] = base =os.path.dirname(__file__)
-    #add base and src dirs (for core code if not installed) to import path
+    os.environ['ADF'] = base = os.path.dirname(__file__)
+    # add base and src dirs (for core code if not installed) to import path
     sys.path.append(base)
-    sys.path.append(os.path.join(base,'src','adf'))
-    
-    #now we can import
+    sys.path.append(os.path.join(base, 'src', 'adf'))
+
+    # now we can import
     from adf import Framework
 
     # parse args, setup signal handlers and jump to main
@@ -81,7 +82,10 @@ def main():
     # trap signals to stop/restart the framework thread
     signal.signal(signal.SIGINT, f.stop)
     signal.signal(signal.SIGTERM, f.stop)
-    signal.signal(signal.SIGHUP, f.restart)
+    try:
+        signal.signal(signal.SIGHUP, f.restart)
+    except:
+        pass  # SIGHUP does not exist on windows
     # now start framework
     f.start(*config)
     if not config:

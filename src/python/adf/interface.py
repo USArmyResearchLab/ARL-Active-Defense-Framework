@@ -256,6 +256,14 @@ try:
             self.info('reading from %s', self.pcap_in)
 
         def open_interface(self):
+            #if we are passed an index, look up the device by it else use the device name
+            alldevs=pcap.findalldevs()
+            try:
+               self.device=alldevs[self.device]
+            except:
+                if self.device not in alldevs:
+                    raise Exception('device %s not present' % self.device)
+            self.info('using %s',self.device)
             self.pcap = pcap.pcap(
                 self.device, timeout_ms=self.timeout_ms, immediate=True)
 
@@ -263,9 +271,9 @@ try:
             '''capture thread, decodes packets and sends them to the next plugin'''
             try:
                 while not self.pcap and not self.is_shutdown():
-                    if self.device:
+                    if self.device is not None:
                         self.open_interface()
-                    elif self.pcap_in:
+                    elif self.pcap_in is not None:
                         self.open_pcap()
                     else:
                         time.sleep(1)
