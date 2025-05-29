@@ -80,12 +80,12 @@ def main():
     # pass our globals as superglobals so import_package can make stuff available in the top-level namespace
     f = Framework(start=False, superglobals=globals())
     # trap signals to stop/restart the framework thread
-    signal.signal(signal.SIGINT, f.stop)
-    signal.signal(signal.SIGTERM, f.stop)
     try:
         signal.signal(signal.SIGHUP, f.restart)
+        signal.signal(signal.SIGINT, f.stop)
+        signal.signal(signal.SIGTERM, f.stop)
     except:
-        pass  # SIGHUP does not exist on windows
+        pass  # SIGHUP does not exist on windows, and we don't want to trap signals if windows
     # now start framework
     f.start(*config)
     if not config:
