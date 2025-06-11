@@ -15,7 +15,7 @@ install_requires = [
 extras_require = {
     'mqtt':    ["paho-mqtt"],
     'tap':     ["python-pytun"],
-    'pcap':    ["pypcap"],
+    'pcap':    ["pcap-ct"],
     'can':     ['python-can', 'cantools'],
     'nfqueue': ['netfilterqueue']
 }
