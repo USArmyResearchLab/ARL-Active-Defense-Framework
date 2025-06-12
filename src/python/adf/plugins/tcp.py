@@ -5,10 +5,11 @@ import random
 
 
 class TCP(Plugin):
-    '''very simple emulation of a TCP stack
-        accepts connections and will call self.tcp_recv(key,info,data) when data has been received
+    '''very quick and dirty TCP stack
+        accepts connections and will call self.tcp_recv(key,info,data) 
+            when data has been received
         to send data, called self.tcp_send(key,info,data)
-        to close connection call self.close_connection(conn)
+        to close connection call self.tcp_close(key,info)
         config options:
             port: set to only accept on this port, else will accept on all
             ip: set to only accept on this IP, else will accept on all
@@ -16,7 +17,7 @@ class TCP(Plugin):
     port = None
     ip = None
 
-    # each conn key will hold a pair of remote, local sequence numbers and a receive, send buffer
+    # each conn key will hold remote seq, local seq, and a resend buffer
     conns = {}
 
     def reply(self, info, seq, ack, flags, data):
@@ -63,10 +64,11 @@ class TCP(Plugin):
         if info['flags'] & dpkt.tcp.TH_SYN:
             # store ISN and generate a random one for our end
             self.conns[key] = [info['seq'] + 1,
-                               random.randint(0, 2**32 - 1), [], []]
-            # reply with SYN+ACK, seq=our ISN, ack=remote ISN+1
+                               random.randint(1, 2**32 - 1), [], []]
+            # generate reply with SYN+ACK, seq=our ISN-1, ack=remote ISN+1
+            # (we just ignore the last ACK of the handshake, we know what our seq should be)
             return self.reply(info,
-                              self.conns[key][1], self.conns[key][0],
+                              self.conns[key][1]-1, self.conns[key][0],
                               dpkt.tcp.TH_SYN | dpkt.tcp.TH_ACK, [])
 
         # from here on we do nothing if we don't have a key
@@ -83,41 +85,47 @@ class TCP(Plugin):
                 del self.conns[key]
                 return reply
 
-            # if we got an ack, just clear the buffer
-            # unless our local seq != ack, in which case resend the buffer if there is anything in it
-            if info['flags'] & dpkt.tcp.TH_ACK:
-                if self.conns[key][1] != info['ack']:
-                    if len(self.conns[key][3]):
-                        return self.reply(info,
-                                          self.conns[key][1], self.conns[key][0],
-                                          dpkt.tcp.TH_PUSH, self.conns[key][3])
-                    else:  # if buffer is empty just bump our local seq, like during handshake
-                        self.conns[key][1] = info['ack']
+            # if we got an ack < our local seq, resend the buffer.
+            if info['flags'] & dpkt.tcp.TH_ACK and info['ack'] < self.conns[key][1]:
+                # resend with our seq rolled back by length of data
+                return self.reply(info,
+                                  self.conns[key][1] - len(self.conns[key][2]),
+                                  self.conns[key][0],
+                                  dpkt.tcp.TH_PUSH | dpkt.tcp.TH_ACK,
+                                  self.conns[key][2])
 
-            # if we got to this point, we can receive data if there is any to receive
-            self.conns[key][0] = info['seq']
-            payload = self.conns[key][2] = info['data'] 
-            if len(payload):
-                # update remote seq for next ack
-                self.conns[key][0] = (self.conns[key][0] + len(payload)) % 2**32
-                # call the recv handler, you'll override this in subclass
-                self.tcp_recv(key, info, payload)
+            # if we get to this point, we can receive data
+            if info['seq'] >= self.conns[key][0]:  # ignore retransmission of old data
+                self.conns[key][0] = info['seq']
+                payload = info['data']
+                if len(payload):
+                    # update remote seq for next ack
+                    self.conns[key][0] = (
+                        self.conns[key][0] + len(payload)) % 2**32
+                    # call the recv handler, you'll override this in subclass
+                    self.tcp_recv(key, info, payload)
 
-        # if we got this far we either don't handle this packet or there is nothing to return    
-        return info, None 
+        # if we got this far we either don't handle this packet or there is nothing to return
+        return info, None
+
+    def tcp_close(self, key, info):
+        self.dispatch(*self.reply(info,
+                                  self.conns[key][1], self.conns[key][0],
+                                  dpkt.tcp.TH_FIN | dpkt.tcp.TH_ACK, []))
 
     def tcp_send(self, key, info, payload):
         # save data in case we need to resend
-        self.conns[key][3] = payload
+        self.conns[key][2] = payload
         # generate seq=last, ack = last seq from remote, push+ack flags
-        reply=self.reply(info,
-                   self.conns[key][1], self.conns[key][0],
-                   dpkt.tcp.TH_PUSH | dpkt.tcp.TH_ACK, payload)
+        reply = self.reply(info,
+                           self.conns[key][1], self.conns[key][0],
+                           dpkt.tcp.TH_PUSH | dpkt.tcp.TH_ACK, payload)
         # update local seq, wrapping at 2^32
         self.conns[key][1] = (self.conns[key][1] + len(payload)) % 2**32
         # send immediately
         self.dispatch(*reply)
 
     def tcp_recv(self, key, info, payload):
-        # default recv function is to echo what we got
+        # default recv function is to echo what we got and close
         self.tcp_send(key, info, payload)
+        self.tcp_close(key, info)
